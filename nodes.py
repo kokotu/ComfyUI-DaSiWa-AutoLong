@@ -206,8 +206,8 @@ def _write_uint8_frames(session: dict, frames) -> int:
     return written
 
 
-def _write_smart_cut_frames(session: dict, previous_frames, current_frames):
-    """Choose a late low-difference cut; never alpha-blend two generated poses."""
+def _find_smart_cut(previous_frames, current_frames):
+    """Choose a late low-difference cut after the new clip has warmed up."""
     count = int(previous_frames.shape[0])
     if count != int(current_frames.shape[0]):
         raise RuntimeError(
@@ -267,11 +267,74 @@ def _write_smart_cut_frames(session: dict, previous_frames, current_frames):
                 best_score = score
                 cut_position = candidate
 
+    return cut_position, best_score
+
+
+def _write_smart_cut_frames(session: dict, previous_frames, current_frames):
+    cut_position, best_score = _find_smart_cut(previous_frames, current_frames)
     written = _write_uint8_frames(session, previous_frames[:cut_position])
     written += _write_frames(
         session, current_frames[cut_position:], skip_count=0
     )
     return written, cut_position, best_score
+
+
+def _write_rife_bridge_frames(
+    session: dict,
+    previous_frames,
+    current_frames,
+    interp_model,
+):
+    """Replace six seam intervals with a short core-RIFE motion bridge."""
+    cut_position, best_score = _find_smart_cut(previous_frames, current_frames)
+    count = int(previous_frames.shape[0])
+    bridge_half_width = 3
+    left_anchor = max(1, cut_position - bridge_half_width)
+    right_anchor = min(count - 2, cut_position + bridge_half_width)
+    bridge_multiplier = right_anchor - left_anchor
+    if bridge_multiplier < 2:
+        return (*_write_smart_cut_frames(
+            session, previous_frames, current_frames
+        ), 0)
+
+    previous_anchor = previous_frames[left_anchor][..., :3].float().div(255.0)
+    current_anchor = (
+        current_frames[right_anchor][..., :3].detach().cpu().float()
+    )
+    anchor_pair = torch.stack((previous_anchor, current_anchor), dim=0)
+
+    try:
+        from comfy_extras.nodes_frame_interpolation import FrameInterpolate
+
+        bridge_output = FrameInterpolate.execute(
+            interp_model,
+            anchor_pair,
+            bridge_multiplier,
+        )
+        bridge_frames = bridge_output[0]
+    except Exception as error:
+        raise RuntimeError(
+            "The short RIFE bridge failed. Update ComfyUI core or disconnect "
+            "RIFE_MODEL_FOR_BRIDGE to fall back to Smart Cut."
+        ) from error
+
+    expected_bridge_frames = bridge_multiplier + 1
+    if int(bridge_frames.shape[0]) != expected_bridge_frames:
+        raise RuntimeError(
+            "Unexpected RIFE bridge length: received "
+            f"{int(bridge_frames.shape[0])}, expected {expected_bridge_frames}."
+        )
+
+    written = _write_uint8_frames(session, previous_frames[:left_anchor])
+    written += _write_frames(session, bridge_frames, skip_count=0)
+    written += _write_frames(
+        session, current_frames[right_anchor + 1 :], skip_count=0
+    )
+    if written != count:
+        raise RuntimeError(
+            f"RIFE bridge wrote {written} overlap frames; expected {count}."
+        )
+    return written, cut_position, best_score, expected_bridge_frames
 
 
 def _finish_encoder(session: dict) -> None:
@@ -654,6 +717,9 @@ class DaSiWaAutoLongWarmupStream:
                     {"default": "video/DaSiWa_GGUF_WARMUP"},
                 ),
             },
+            "optional": {
+                "interp_model": ("INTERP_MODEL",),
+            },
             "hidden": {
                 "prompt": "PROMPT",
                 "unique_id": "UNIQUE_ID",
@@ -683,6 +749,7 @@ class DaSiWaAutoLongWarmupStream:
         crf,
         preset,
         filename_prefix,
+        interp_model=None,
         prompt=None,
         unique_id=None,
     ):
@@ -763,16 +830,31 @@ class DaSiWaAutoLongWarmupStream:
                         "Warm-up settings changed between segments. Keep frame count, "
                         "warmup_frames and interpolation_multiplier unchanged."
                     )
-                written, cut_position, cut_score = _write_smart_cut_frames(
-                    session, pending_tail, frames[:tail_count]
-                )
+                if interp_model is None:
+                    written, cut_position, cut_score = _write_smart_cut_frames(
+                        session, pending_tail, frames[:tail_count]
+                    )
+                    bridge_message = "Smart Cut fallback"
+                else:
+                    (
+                        written,
+                        cut_position,
+                        cut_score,
+                        bridge_frame_count,
+                    ) = _write_rife_bridge_frames(
+                        session,
+                        pending_tail,
+                        frames[:tail_count],
+                        interp_model,
+                    )
+                    bridge_message = f"RIFE bridge={bridge_frame_count} frames"
                 written += _write_frames(
                     session, frames[tail_count:tail_start], skip_count=0
                 )
                 print(
-                    "[DaSiWa AutoLong Smart Cut] "
+                    "[DaSiWa AutoLong Seam] "
                     f"Overlap cut at {cut_position}/{tail_count - 1}, "
-                    f"score={cut_score:.5f}"
+                    f"score={cut_score:.5f}, {bridge_message}"
                 )
 
             output_path = session["output_path"]
