@@ -9,6 +9,7 @@ import uuid
 
 import folder_paths
 import server
+import torch
 
 
 _SESSIONS: dict[str, dict] = {}
@@ -47,6 +48,7 @@ def _reset_session(session_id: str) -> dict:
         "run_id": uuid.uuid4().hex,
         "process": None,
         "last_frame": None,
+        "last_latent": None,
         "output_path": None,
         "subfolder": "",
         "filename": "",
@@ -140,9 +142,14 @@ def _start_encoder(
     )
 
 
-def _write_frames(session: dict, frames, skip_first: bool) -> int:
+def _write_frames(session: dict, frames, skip_count: int) -> int:
     process = session["process"]
-    start = 1 if skip_first else 0
+    start = max(0, int(skip_count))
+    if start >= int(frames.shape[0]):
+        raise RuntimeError(
+            f"Cannot skip {start} frames from a segment containing only "
+            f"{int(frames.shape[0])} frames."
+        )
     written = 0
 
     try:
@@ -239,8 +246,15 @@ class DaSiWaAutoLongStart:
             "hidden": {"unique_id": "UNIQUE_ID"},
         }
 
-    RETURN_TYPES = ("IMAGE", "INT", "INT", "STRING")
-    RETURN_NAMES = ("start_image", "index", "total", "session_id")
+    RETURN_TYPES = ("IMAGE", "INT", "INT", "STRING", "LATENT", "INT")
+    RETURN_NAMES = (
+        "start_image",
+        "index",
+        "total",
+        "session_id",
+        "previous_latent",
+        "motion_latent_count",
+    )
     FUNCTION = "begin_segment"
     CATEGORY = "DaSiWa/Auto Long Video"
 
@@ -257,6 +271,8 @@ class DaSiWaAutoLongStart:
             if iteration == 0:
                 _reset_session(session_id)
                 start_image = initial_image
+                previous_latent = {"samples": torch.zeros((1, 16, 1, 1, 1))}
+                motion_latent_count = 0
             else:
                 session = _SESSIONS.get(session_id)
                 if not session or session.get("last_frame") is None:
@@ -264,12 +280,25 @@ class DaSiWaAutoLongStart:
                         "AutoLong continuation state is missing. Set iteration back to 0 and queue again."
                     )
                 start_image = session["last_frame"]
+                if session.get("last_latent") is None:
+                    previous_latent = {"samples": torch.zeros((1, 16, 1, 1, 1))}
+                    motion_latent_count = 0
+                else:
+                    previous_latent = session["last_latent"]
+                    motion_latent_count = 1
 
         print(f"[DaSiWa AutoLong] Segment {iteration + 1}/{total_segments}")
-        return (start_image, iteration, total_segments, session_id)
+        return (
+            start_image,
+            iteration,
+            total_segments,
+            session_id,
+            previous_latent,
+            motion_latent_count,
+        )
 
 
-class DaSiWaAutoLongStream:
+class DaSiWaAutoLongStreamSVIPro:
     PRESETS = ["ultrafast", "veryfast", "fast", "medium", "slow"]
 
     @classmethod
@@ -282,12 +311,23 @@ class DaSiWaAutoLongStream:
                 "total_segments": ("INT", {"forceInput": True}),
                 "session_id": ("STRING", {"forceInput": True}),
                 "frame_rate": ("FLOAT", {"default": 32.0, "min": 1.0, "max": 240.0}),
+                "overlap_frames": (
+                    "INT",
+                    {"default": 1, "min": 1, "max": 32, "step": 1},
+                ),
+                "interpolation_multiplier": (
+                    "INT",
+                    {"default": 2, "min": 1, "max": 16, "step": 1},
+                ),
                 "crf": ("INT", {"default": 17, "min": 0, "max": 51, "step": 1}),
                 "preset": (cls.PRESETS, {"default": "medium"}),
                 "filename_prefix": (
                     "STRING",
                     {"default": "video/DaSiWa_AUTO_LONG"},
                 ),
+            },
+            "optional": {
+                "samples": ("LATENT",),
             },
             "hidden": {
                 "prompt": "PROMPT",
@@ -313,14 +353,19 @@ class DaSiWaAutoLongStream:
         total_segments,
         session_id,
         frame_rate,
+        overlap_frames,
+        interpolation_multiplier,
         crf,
         preset,
         filename_prefix,
         prompt=None,
         unique_id=None,
+        samples=None,
     ):
         index = int(index)
         total_segments = int(total_segments)
+        overlap_frames = int(overlap_frames)
+        interpolation_multiplier = int(interpolation_multiplier)
         if index < 0 or index >= total_segments:
             raise RuntimeError(f"Invalid segment index {index} for total {total_segments}.")
         if len(frames.shape) != 4 or frames.shape[-1] < 3:
@@ -353,8 +398,30 @@ class DaSiWaAutoLongStream:
             if abs(session["frame_rate"] - float(frame_rate)) > 0.001:
                 raise RuntimeError("Frame rate changed between segments.")
 
-            written = _write_frames(session, frames, skip_first=index > 0)
-            session["last_frame"] = last_frame[-1:].detach().cpu().clone()
+            # A continued SVI clip begins with the previous clip's motion frames.
+            # After Nx interpolation, those duplicated frames occupy
+            # multiplier * (overlap - 1) + 1 output frames.  Skip exactly that
+            # prefix while retaining the newly interpolated transition from the
+            # final overlap frame into the first new frame.
+            skip_count = 0
+            if index > 0:
+                skip_count = interpolation_multiplier * (overlap_frames - 1) + 1
+
+            written = _write_frames(session, frames, skip_count=skip_count)
+            if int(last_frame.shape[0]) < overlap_frames:
+                raise RuntimeError(
+                    f"Need {overlap_frames} raw continuation frames, but received "
+                    f"only {int(last_frame.shape[0])}."
+                )
+            session["last_frame"] = (
+                last_frame[-overlap_frames:].detach().cpu().clone()
+            )
+            if samples is not None:
+                if not isinstance(samples, dict) or "samples" not in samples:
+                    raise RuntimeError("Expected a LATENT dictionary containing 'samples'.")
+                session["last_latent"] = {
+                    "samples": samples["samples"].detach().cpu().clone()
+                }
             output_path = session["output_path"]
 
             is_final = index + 1 >= total_segments
@@ -390,12 +457,74 @@ class DaSiWaAutoLongStream:
         return {"ui": ui, "result": (filenames, output_path)}
 
 
+class DaSiWaAutoLongStream(DaSiWaAutoLongStreamSVIPro):
+    """Backward-compatible single-tail-frame writer used by existing workflows."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "frames": ("IMAGE",),
+                "last_frame": ("IMAGE",),
+                "index": ("INT", {"forceInput": True}),
+                "total_segments": ("INT", {"forceInput": True}),
+                "session_id": ("STRING", {"forceInput": True}),
+                "frame_rate": ("FLOAT", {"default": 32.0, "min": 1.0, "max": 240.0}),
+                "crf": ("INT", {"default": 17, "min": 0, "max": 51, "step": 1}),
+                "preset": (cls.PRESETS, {"default": "medium"}),
+                "filename_prefix": (
+                    "STRING",
+                    {"default": "video/DaSiWa_AUTO_LONG"},
+                ),
+            },
+            "hidden": {
+                "prompt": "PROMPT",
+                "unique_id": "UNIQUE_ID",
+            },
+        }
+
+    FUNCTION = "append_segment_legacy"
+
+    def append_segment_legacy(
+        self,
+        frames,
+        last_frame,
+        index,
+        total_segments,
+        session_id,
+        frame_rate,
+        crf,
+        preset,
+        filename_prefix,
+        prompt=None,
+        unique_id=None,
+    ):
+        return super().append_segment(
+            frames=frames,
+            last_frame=last_frame,
+            index=index,
+            total_segments=total_segments,
+            session_id=session_id,
+            frame_rate=frame_rate,
+            overlap_frames=1,
+            interpolation_multiplier=2,
+            crf=crf,
+            preset=preset,
+            filename_prefix=filename_prefix,
+            prompt=prompt,
+            unique_id=unique_id,
+            samples=None,
+        )
+
+
 NODE_CLASS_MAPPINGS = {
     "DaSiWaAutoLongStart": DaSiWaAutoLongStart,
     "DaSiWaAutoLongStream": DaSiWaAutoLongStream,
+    "DaSiWaAutoLongStreamSVIPro": DaSiWaAutoLongStreamSVIPro,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "DaSiWaAutoLongStart": "DaSiWa AutoLong Start",
     "DaSiWaAutoLongStream": "DaSiWa AutoLong Stream Writer",
+    "DaSiWaAutoLongStreamSVIPro": "DaSiWa AutoLong SVI Pro Stream Writer",
 }
