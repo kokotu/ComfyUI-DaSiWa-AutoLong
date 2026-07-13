@@ -190,8 +190,24 @@ def _frames_to_uint8_cpu(frames):
     )
 
 
-def _write_blended_frames(session: dict, previous_frames, current_frames) -> int:
-    """Cosine blend two equally-sized IMAGE batches without retaining float copies."""
+def _write_uint8_frames(session: dict, frames) -> int:
+    process = session["process"]
+    written = 0
+    try:
+        for frame in frames:
+            process.stdin.write(frame[..., :3].contiguous().numpy().tobytes())
+            written += 1
+    except (BrokenPipeError, OSError) as error:
+        details = b""
+        if process.stderr:
+            details = process.stderr.read()
+        message = details.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"FFmpeg stopped while encoding: {message or error}") from error
+    return written
+
+
+def _write_smart_cut_frames(session: dict, previous_frames, current_frames):
+    """Choose a late low-difference cut; never alpha-blend two generated poses."""
     count = int(previous_frames.shape[0])
     if count != int(current_frames.shape[0]):
         raise RuntimeError(
@@ -201,36 +217,61 @@ def _write_blended_frames(session: dict, previous_frames, current_frames) -> int
     if tuple(previous_frames.shape[1:3]) != tuple(current_frames.shape[1:3]):
         raise RuntimeError("Warm-up overlap resolution changed between segments.")
 
-    process = session["process"]
-    written = 0
-    try:
-        for position, (previous, current) in enumerate(
-            zip(previous_frames, current_frames)
-        ):
-            current = (
-                current.detach()
-                .clamp(0.0, 1.0)
-                .mul(255.0)
-                .byte()
-                .cpu()
-                .contiguous()[..., :3]
-            )
-            if count == 1:
-                weight = 1.0
-            else:
-                phase = position / (count - 1)
-                weight = 0.5 - 0.5 * math.cos(math.pi * phase)
-            blended = torch.lerp(previous.float(), current.float(), weight)
-            process.stdin.write(blended.round().clamp(0, 255).byte().numpy().tobytes())
-            written += 1
-    except (BrokenPipeError, OSError) as error:
-        details = b""
-        if process.stderr:
-            details = process.stderr.read()
-        message = details.decode("utf-8", errors="replace").strip()
-        raise RuntimeError(f"FFmpeg stopped while encoding: {message or error}") from error
+    # Compare small CPU previews.  The search is restricted to the latter half
+    # of the overlap so the new generation has already had time to start moving.
+    height, width = int(previous_frames.shape[1]), int(previous_frames.shape[2])
+    preview_step = max(1, min(height, width) // 96)
+    previous_preview = previous_frames[
+        :, ::preview_step, ::preview_step, :3
+    ].float().div(255.0)
+    current_preview = (
+        current_frames[:, ::preview_step, ::preview_step, :3]
+        .detach()
+        .clamp(0.0, 1.0)
+        .cpu()
+        .float()
+    )
 
-    return written
+    first_candidate = max(2, math.ceil((count - 1) * 0.55))
+    last_candidate = min(count - 2, math.floor((count - 1) * 0.90))
+    if first_candidate > last_candidate:
+        cut_position = max(1, min(count - 1, count // 2))
+        best_score = 0.0
+    else:
+        target_position = (count - 1) * 0.75
+        cut_position = first_candidate
+        best_score = float("inf")
+        for candidate in range(first_candidate, last_candidate + 1):
+            boundary_jump = (
+                previous_preview[candidate - 1] - current_preview[candidate]
+            ).abs().mean().item()
+            same_time_difference = (
+                previous_preview[candidate] - current_preview[candidate]
+            ).abs().mean().item()
+            previous_motion = (
+                previous_preview[candidate - 1]
+                - previous_preview[candidate - 2]
+            ).abs().mean().item()
+            current_motion = (
+                current_preview[candidate + 1] - current_preview[candidate]
+            ).abs().mean().item()
+            motion_difference = abs(previous_motion - current_motion)
+            timing_penalty = abs(candidate - target_position) / count
+            score = (
+                boundary_jump
+                + 0.25 * same_time_difference
+                + 0.15 * motion_difference
+                + 0.02 * timing_penalty
+            )
+            if score < best_score:
+                best_score = score
+                cut_position = candidate
+
+    written = _write_uint8_frames(session, previous_frames[:cut_position])
+    written += _write_frames(
+        session, current_frames[cut_position:], skip_count=0
+    )
+    return written, cut_position, best_score
 
 
 def _finish_encoder(session: dict) -> None:
@@ -722,11 +763,16 @@ class DaSiWaAutoLongWarmupStream:
                         "Warm-up settings changed between segments. Keep frame count, "
                         "warmup_frames and interpolation_multiplier unchanged."
                     )
-                written = _write_blended_frames(
+                written, cut_position, cut_score = _write_smart_cut_frames(
                     session, pending_tail, frames[:tail_count]
                 )
                 written += _write_frames(
                     session, frames[tail_count:tail_start], skip_count=0
+                )
+                print(
+                    "[DaSiWa AutoLong Smart Cut] "
+                    f"Overlap cut at {cut_position}/{tail_count - 1}, "
+                    f"score={cut_score:.5f}"
                 )
 
             output_path = session["output_path"]
