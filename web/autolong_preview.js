@@ -13,7 +13,7 @@ app.registerExtension({
     name: "DaSiWa.AutoLong.Preview",
 
     async beforeRegisterNodeDef(nodeType, nodeData) {
-        if (!["DaSiWaAutoLongStream", "DaSiWaAutoLongStreamSVIPro"].includes(nodeData?.name)) return;
+        if (!["DaSiWaAutoLongStream", "DaSiWaAutoLongStreamSVIPro", "DaSiWaAutoLongWarmupStream"].includes(nodeData?.name)) return;
 
         chainCallback(nodeType.prototype, "onNodeCreated", function () {
             const container = document.createElement("div");

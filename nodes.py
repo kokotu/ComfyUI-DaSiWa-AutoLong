@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import os
 import shutil
 import subprocess
@@ -48,6 +49,8 @@ def _reset_session(session_id: str) -> dict:
         "run_id": uuid.uuid4().hex,
         "process": None,
         "last_frame": None,
+        "rewind_frame": None,
+        "pending_tail": None,
         "last_latent": None,
         "output_path": None,
         "subfolder": "",
@@ -175,6 +178,61 @@ def _write_frames(session: dict, frames, skip_count: int) -> int:
     return written
 
 
+def _frames_to_uint8_cpu(frames):
+    return (
+        frames.detach()
+        .clamp(0.0, 1.0)
+        .mul(255.0)
+        .byte()
+        .cpu()
+        .contiguous()[..., :3]
+        .clone()
+    )
+
+
+def _write_blended_frames(session: dict, previous_frames, current_frames) -> int:
+    """Cosine blend two equally-sized IMAGE batches without retaining float copies."""
+    count = int(previous_frames.shape[0])
+    if count != int(current_frames.shape[0]):
+        raise RuntimeError(
+            "Warm-up overlap size changed between segments: "
+            f"{count} previous frames vs {int(current_frames.shape[0])} current frames."
+        )
+    if tuple(previous_frames.shape[1:3]) != tuple(current_frames.shape[1:3]):
+        raise RuntimeError("Warm-up overlap resolution changed between segments.")
+
+    process = session["process"]
+    written = 0
+    try:
+        for position, (previous, current) in enumerate(
+            zip(previous_frames, current_frames)
+        ):
+            current = (
+                current.detach()
+                .clamp(0.0, 1.0)
+                .mul(255.0)
+                .byte()
+                .cpu()
+                .contiguous()[..., :3]
+            )
+            if count == 1:
+                weight = 1.0
+            else:
+                phase = position / (count - 1)
+                weight = 0.5 - 0.5 * math.cos(math.pi * phase)
+            blended = torch.lerp(previous.float(), current.float(), weight)
+            process.stdin.write(blended.round().clamp(0, 255).byte().numpy().tobytes())
+            written += 1
+    except (BrokenPipeError, OSError) as error:
+        details = b""
+        if process.stderr:
+            details = process.stderr.read()
+        message = details.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"FFmpeg stopped while encoding: {message or error}") from error
+
+    return written
+
+
 def _finish_encoder(session: dict) -> None:
     process = session["process"]
     try:
@@ -275,11 +333,16 @@ class DaSiWaAutoLongStart:
                 motion_latent_count = 0
             else:
                 session = _SESSIONS.get(session_id)
-                if not session or session.get("last_frame") is None:
+                continuation_frame = None
+                if session:
+                    continuation_frame = session.get("rewind_frame")
+                    if continuation_frame is None:
+                        continuation_frame = session.get("last_frame")
+                if continuation_frame is None:
                     raise RuntimeError(
                         "AutoLong continuation state is missing. Set iteration back to 0 and queue again."
                     )
-                start_image = session["last_frame"]
+                start_image = continuation_frame
                 if session.get("last_latent") is None:
                     previous_latent = {"samples": torch.zeros((1, 16, 1, 1, 1))}
                     motion_latent_count = 0
@@ -517,14 +580,210 @@ class DaSiWaAutoLongStream(DaSiWaAutoLongStreamSVIPro):
         )
 
 
+class DaSiWaAutoLongWarmupStream:
+    """GGUF-only writer that hides motion restarts inside a short overlap."""
+
+    PRESETS = DaSiWaAutoLongStreamSVIPro.PRESETS
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "frames": ("IMAGE",),
+                "raw_frames": ("IMAGE",),
+                "index": ("INT", {"forceInput": True}),
+                "total_segments": ("INT", {"forceInput": True}),
+                "session_id": ("STRING", {"forceInput": True}),
+                "frame_rate": (
+                    "FLOAT",
+                    {"default": 32.0, "min": 1.0, "max": 240.0},
+                ),
+                "warmup_frames": (
+                    "INT",
+                    {"default": 16, "min": 1, "max": 32, "step": 1},
+                ),
+                "interpolation_multiplier": (
+                    "INT",
+                    {"default": 2, "min": 1, "max": 16, "step": 1},
+                ),
+                "crf": ("INT", {"default": 17, "min": 0, "max": 51, "step": 1}),
+                "preset": (cls.PRESETS, {"default": "medium"}),
+                "filename_prefix": (
+                    "STRING",
+                    {"default": "video/DaSiWa_GGUF_WARMUP"},
+                ),
+            },
+            "hidden": {
+                "prompt": "PROMPT",
+                "unique_id": "UNIQUE_ID",
+            },
+        }
+
+    RETURN_TYPES = ("VHS_FILENAMES", "STRING")
+    RETURN_NAMES = ("filenames", "video_path")
+    OUTPUT_NODE = True
+    FUNCTION = "append_segment"
+    CATEGORY = "DaSiWa/Auto Long Video"
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("nan")
+
+    def append_segment(
+        self,
+        frames,
+        raw_frames,
+        index,
+        total_segments,
+        session_id,
+        frame_rate,
+        warmup_frames,
+        interpolation_multiplier,
+        crf,
+        preset,
+        filename_prefix,
+        prompt=None,
+        unique_id=None,
+    ):
+        index = int(index)
+        total_segments = int(total_segments)
+        warmup_frames = int(warmup_frames)
+        interpolation_multiplier = int(interpolation_multiplier)
+        if index < 0 or index >= total_segments:
+            raise RuntimeError(f"Invalid segment index {index} for total {total_segments}.")
+        if len(frames.shape) != 4 or frames.shape[-1] < 3:
+            raise RuntimeError(f"Expected IMAGE frames in NHWC format, got {tuple(frames.shape)}.")
+        if len(raw_frames.shape) != 4 or raw_frames.shape[-1] < 3:
+            raise RuntimeError(
+                f"Expected raw IMAGE frames in NHWC format, got {tuple(raw_frames.shape)}."
+            )
+
+        raw_count = int(raw_frames.shape[0])
+        stride_raw = raw_count - warmup_frames - 1
+        if stride_raw <= warmup_frames:
+            raise RuntimeError(
+                "The raw segment is too short for this warm-up. Increase the generated "
+                "frame count or reduce warmup_frames."
+            )
+
+        expected_frames = interpolation_multiplier * (raw_count - 1) + 1
+        actual_frames = int(frames.shape[0])
+        if actual_frames != expected_frames:
+            raise RuntimeError(
+                "Unexpected interpolated frame count: received "
+                f"{actual_frames}, expected {expected_frames} from {raw_count} raw frames "
+                f"at {interpolation_multiplier}x."
+            )
+
+        tail_start = interpolation_multiplier * stride_raw
+        tail_count = actual_frames - tail_start
+        if tail_start <= tail_count:
+            raise RuntimeError(
+                "Warm-up overlap is longer than the visible segment. Reduce warmup_frames."
+            )
+
+        height, width = int(frames.shape[1]), int(frames.shape[2])
+        if width % 2 or height % 2:
+            raise RuntimeError("H.264 yuv420p output requires even width and height.")
+
+        with _LOCK:
+            session = _SESSIONS.get(str(session_id))
+            if session is None:
+                raise RuntimeError("AutoLong session not found. Set iteration to 0 and queue again.")
+
+            if index == 0:
+                _start_encoder(
+                    session,
+                    width,
+                    height,
+                    float(frame_rate),
+                    int(crf),
+                    preset,
+                    filename_prefix,
+                )
+            elif session.get("process") is None:
+                raise RuntimeError("AutoLong FFmpeg stream is not active.")
+
+            if (session["width"], session["height"]) != (width, height):
+                raise RuntimeError("Frame size changed between segments; continuous encoding is impossible.")
+            if abs(session["frame_rate"] - float(frame_rate)) > 0.001:
+                raise RuntimeError("Frame rate changed between segments.")
+
+            if index == 0:
+                written = _write_frames(session, frames[:tail_start], skip_count=0)
+            else:
+                pending_tail = session.get("pending_tail")
+                if pending_tail is None:
+                    raise RuntimeError(
+                        "Warm-up overlap state is missing. Set iteration back to 0 and queue again."
+                    )
+                if int(pending_tail.shape[0]) != tail_count:
+                    raise RuntimeError(
+                        "Warm-up settings changed between segments. Keep frame count, "
+                        "warmup_frames and interpolation_multiplier unchanged."
+                    )
+                written = _write_blended_frames(
+                    session, pending_tail, frames[:tail_count]
+                )
+                written += _write_frames(
+                    session, frames[tail_count:tail_start], skip_count=0
+                )
+
+            output_path = session["output_path"]
+            is_final = index + 1 >= total_segments
+            if is_final:
+                session["pending_tail"] = None
+                session["rewind_frame"] = None
+                _finish_encoder(session)
+            else:
+                rewind_frame = raw_frames[stride_raw : stride_raw + 1]
+                session["rewind_frame"] = rewind_frame.detach().cpu().clone()
+                session["last_frame"] = session["rewind_frame"]
+                session["pending_tail"] = _frames_to_uint8_cpu(
+                    frames[tail_start:]
+                )
+                _requeue_current_workflow(str(session_id), index + 1)
+
+        print(
+            f"[DaSiWa AutoLong Warm-up] Wrote {written} frames for segment "
+            f"{index + 1}/{total_segments}: {output_path}"
+        )
+
+        filenames = (True, [output_path])
+        if is_final:
+            ui = {
+                "gifs": [
+                    {
+                        "filename": session["filename"],
+                        "subfolder": session["subfolder"],
+                        "type": "output",
+                        "format": "video/h264-mp4",
+                    }
+                ],
+                "text": [
+                    f"Completed {total_segments} GGUF warm-up segments: {output_path}"
+                ],
+            }
+        else:
+            ui = {
+                "text": [
+                    f"Segment {index + 1}/{total_segments} complete; "
+                    "next warm-up segment queued automatically."
+                ]
+            }
+        return {"ui": ui, "result": (filenames, output_path)}
+
+
 NODE_CLASS_MAPPINGS = {
     "DaSiWaAutoLongStart": DaSiWaAutoLongStart,
     "DaSiWaAutoLongStream": DaSiWaAutoLongStream,
     "DaSiWaAutoLongStreamSVIPro": DaSiWaAutoLongStreamSVIPro,
+    "DaSiWaAutoLongWarmupStream": DaSiWaAutoLongWarmupStream,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "DaSiWaAutoLongStart": "DaSiWa AutoLong Start",
     "DaSiWaAutoLongStream": "DaSiWa AutoLong Stream Writer",
     "DaSiWaAutoLongStreamSVIPro": "DaSiWa AutoLong SVI Pro Stream Writer",
+    "DaSiWaAutoLongWarmupStream": "DaSiWa AutoLong GGUF Warm-up Stream Writer",
 }
